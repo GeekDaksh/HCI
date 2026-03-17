@@ -1,5 +1,5 @@
-game,satisfaction,boring,horrible,calm,funny,workload
-G1,2,9,1,1,1,4.33
-G2,4,3,1,1,1,6.33
-G3,2,1,6,6,6,7.0
-G4,9,1,1,1,1,7.0
+subject,game,valence,arousal,workload_continuous,workload_class,workload_label
+(S23),G1,2,9,8.5,2,high
+(S23),G2,4,3,4.5,1,medium
+(S23),G3,2,1,4.5,1,medium
+(S23),G4,9,1,1.0,0,low
