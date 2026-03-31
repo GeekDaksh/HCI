@@ -1,5 +1,5 @@
 subject,game,valence,arousal,workload_continuous,workload_class,workload_label
-(S07),G1,5,8,6.5,2,high
-(S07),G2,6,3,3.5,0,low
-(S07),G3,6,1,2.5,0,low
-(S07),G4,8,1,1.5,0,low
+(S07),G1,5,8,9.0,2,high
+(S07),G2,6,3,6.3333,1,medium
+(S07),G3,6,1,6.3333,1,medium
+(S07),G4,8,1,1.0,0,low

@@ -1,0 +1,638 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, classification_report,
+    confusion_matrix, f1_score, cohen_kappa_score,
+    roc_auc_score, roc_curve
+)
+from sklearn.preprocessing import label_binarize
+from dataset_loader import load_dataset, loso_splits
+
+# ─────────────────────────────────────────────
+#  CONFIGURATION
+# ─────────────────────────────────────────────
+
+RESULTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "results"
+)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+DEVICE = (
+    torch.device("mps") if torch.backends.mps.is_available()
+    else torch.device("cuda") if torch.cuda.is_available()
+    else torch.device("cpu")
+)
+LABELS     = ["Low", "Medium", "High"]
+COLORS     = ["#4C72B0", "#DD8452", "#55A868"]
+SEQ_COLORS = ["#993C1D", "#D85A30", "#F0997B"]   # coral ramp for TCN
+
+# Sequence parameters — identical to BiLSTM for fair comparison
+SEQ_LEN    = 15    # 15 consecutive windows = 30 seconds
+STRIDE     = 1
+
+# Model hyperparameters
+INPUT_DIM    = 77
+N_CLASSES    = 3
+TCN_CHANNELS = [128, 128, 256, 256]   # channels per TCN block
+KERNEL_SIZE  = 3                        # temporal kernel
+DROPOUT      = 0.2
+
+# Training
+EPOCHS     = 30
+BATCH_SIZE = 256
+LR         = 1e-3
+PATIENCE   = 7
+
+
+# ─────────────────────────────────────────────
+#  SEQUENCE BUILDER  (shared with BiLSTM)
+# ─────────────────────────────────────────────
+
+def build_sequences(X, y, seq_len=SEQ_LEN, stride=STRIDE):
+    n = len(X)
+    X_seq, y_seq = [], []
+    for i in range(0, n - seq_len + 1, stride):
+        X_seq.append(X[i: i + seq_len])
+        y_seq.append(y[i + seq_len - 1])
+    return np.array(X_seq, dtype=np.float32), np.array(y_seq, dtype=np.int64)
+
+
+def build_sequences_by_subject(X, y, subject_ids, seq_len=SEQ_LEN):
+    X_all, y_all = [], []
+    for subj in np.unique(subject_ids):
+        mask = subject_ids == subj
+        X_s, y_s = build_sequences(X[mask], y[mask], seq_len)
+        X_all.append(X_s)
+        y_all.append(y_s)
+    return np.vstack(X_all), np.concatenate(y_all)
+
+
+# ─────────────────────────────────────────────
+#  TCN ARCHITECTURE
+# ─────────────────────────────────────────────
+
+class CausalConv1d(nn.Module):
+    """
+    Causal dilated 1D convolution — no future leakage.
+
+    Standard conv1d with padding=(kernel_size-1)*dilation on the LEFT only.
+    This ensures that at time t, the convolution only sees times <= t,
+    making the model valid for online/real-time workload prediction.
+
+    Dilation grows exponentially: 1, 2, 4, 8, ...
+    Receptive field = 1 + (kernel_size-1) * sum(dilations)
+    For kernel=3, 4 blocks, dilations=[1,2,4,8]:
+      RF = 1 + 2*(1+2+4+8) = 31 steps = 62 seconds of EEG context
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dilation):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv    = nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            padding=self.padding, dilation=dilation
+        )
+
+    def forward(self, x):
+        # Remove future padding: keep only left-padded positions
+        out = self.conv(x)
+        return out[:, :, :-self.padding] if self.padding > 0 else out
+
+
+class TCNBlock(nn.Module):
+    """
+    Single TCN residual block.
+
+    Architecture (He et al. 2016 residual learning):
+      CausalConv1d → WeightNorm → ReLU → Dropout
+      CausalConv1d → WeightNorm → ReLU → Dropout
+      + residual connection (1x1 conv if channels differ)
+
+    Weight normalisation instead of BatchNorm — more stable on short
+    EEG sequences and avoids batch statistics issues at inference.
+
+    Why residual connections:
+      Allows gradients to flow directly through the skip path during
+      backprop, enabling training of deep dilated networks without
+      vanishing gradients.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+        super().__init__()
+
+        self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
+        nn.utils.weight_norm(self.conv1.conv)
+        self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation)
+        nn.utils.weight_norm(self.conv2.conv)
+        self.relu1   = nn.ReLU()
+        self.relu2   = nn.ReLU()
+        self.drop1   = nn.Dropout(dropout)
+        self.drop2   = nn.Dropout(dropout)
+
+        # 1×1 conv to match channels for residual if needed
+        self.downsample = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels else None
+        )
+        self.relu_out = nn.ReLU()
+
+    def forward(self, x):
+        """x: (batch, channels, seq_len)"""
+        residual = x if self.downsample is None else self.downsample(x)
+        out = self.drop1(self.relu1(self.conv1(x)))
+        out = self.drop2(self.relu2(self.conv2(out)))
+        return self.relu_out(out + residual)
+
+
+class TCN(nn.Module):
+    """
+    Temporal Convolutional Network for EEG workload classification.
+
+    Architecture
+    ------------
+    Input (batch, seq_len, 77)
+      → transpose to (batch, 77, seq_len)   [channels-first for Conv1d]
+      → InputProjection: 77 → 128           [match TCN channel count]
+      → TCNBlock(128→128, dilation=1)
+      → TCNBlock(128→128, dilation=2)
+      → TCNBlock(128→256, dilation=4)
+      → TCNBlock(256→256, dilation=8)
+      → GlobalAvgPool over time             [collapse temporal dim]
+      → LayerNorm
+      → Linear(256, 128) + GELU + Dropout
+      → Linear(128, 3)
+      → logits (batch, 3)
+
+    Why TCN over LSTM:
+      1. Parallelisable — all time steps computed simultaneously (GPU efficient)
+      2. Stable gradients — no vanishing gradient through time
+      3. Controllable receptive field via dilation — explicit temporal scale
+      4. Causal — no future leakage, valid for real-time deployment
+      5. Typically converges faster than LSTM on fixed-length sequences
+
+    Receptive field calculation:
+      kernel=3, dilations=[1,2,4,8]
+      RF = 1 + 2 * (1+2+4+8) * 2 conv layers = 61 steps
+      > SEQ_LEN=15, so every output sees the full input sequence
+    """
+    def __init__(self, input_dim, tcn_channels, kernel_size, dropout, n_classes):
+        super().__init__()
+
+        # Project input features to first TCN channel count
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, tcn_channels[0]),
+            nn.GELU(),
+        )
+
+        # Build TCN blocks with exponentially growing dilation
+        layers = []
+        for i, out_ch in enumerate(tcn_channels):
+            in_ch    = tcn_channels[i-1] if i > 0 else tcn_channels[0]
+            dilation = 2 ** i
+            layers.append(TCNBlock(in_ch, out_ch, kernel_size, dilation, dropout))
+        self.tcn = nn.Sequential(*layers)
+
+        self.norm = nn.LayerNorm(tcn_channels[-1])
+
+        self.classifier = nn.Sequential(
+            nn.Linear(tcn_channels[-1], 128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x):
+        """x: (batch, seq_len, input_dim)"""
+        # Project each time step
+        x = self.input_proj(x)                 # (batch, seq_len, tcn_channels[0])
+        x = x.transpose(1, 2)                  # (batch, channels, seq_len)
+        x = self.tcn(x)                         # (batch, tcn_channels[-1], seq_len)
+        x = x.mean(dim=2)                       # global average pool → (batch, channels)
+        x = self.norm(x)
+        return self.classifier(x)               # (batch, n_classes)
+
+
+# ─────────────────────────────────────────────
+#  TRAINING HELPERS
+# ─────────────────────────────────────────────
+
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(DEVICE)
+        y_batch = y_batch.to(DEVICE)
+        optimizer.zero_grad()
+        logits = model(X_batch)
+        loss   = criterion(logits, y_batch)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item() * len(y_batch)
+        correct    += (logits.argmax(1) == y_batch).sum().item()
+        total      += len(y_batch)
+    return total_loss / total, correct / total
+
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    preds, probs, labels = [], [], []
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(DEVICE)
+        logits  = model(X_batch)
+        p       = torch.softmax(logits, dim=1).cpu().numpy()
+        preds.extend(logits.argmax(1).cpu().numpy())
+        probs.extend(p)
+        labels.extend(y_batch.numpy())
+    return np.array(labels), np.array(preds), np.array(probs)
+
+
+# ─────────────────────────────────────────────
+#  LOSO TRAINING LOOP
+# ─────────────────────────────────────────────
+
+def run_loso(X, y_class, subject_ids, subjects):
+    n_subjects = len(np.unique(subject_ids))
+    fold_accs, fold_f1s, fold_kappas = [], [], []
+    all_y_true, all_y_pred, all_y_prob = [], [], []
+    train_losses_all = []
+
+    print(f"TCN — LOSO cross-validation ({n_subjects} folds)")
+    print(f"  seq_len={SEQ_LEN}  channels={TCN_CHANNELS}  "
+          f"kernel={KERNEL_SIZE}  dropout={DROPOUT}  device={DEVICE}")
+    print(f"  Receptive field: {1 + (KERNEL_SIZE-1)*2*sum(2**i for i in range(len(TCN_CHANNELS)))} steps")
+    print(f"{'='*65}")
+
+    for fold, test_subj, X_train, y_train, X_test, y_test in loso_splits(
+        X, y_class, subject_ids
+    ):
+        subj_str = np.unique(subjects[subject_ids == test_subj])[0]
+
+        scaler  = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test  = scaler.transform(X_test)
+
+        train_mask    = ~(subject_ids == test_subj)
+        train_sub_ids = subject_ids[train_mask]
+
+        X_tr_seq, y_tr_seq = build_sequences_by_subject(
+            X_train, y_train, train_sub_ids, SEQ_LEN
+        )
+        X_te_seq, y_te_seq = build_sequences(X_test, y_test, SEQ_LEN)
+
+        if len(X_tr_seq) == 0 or len(X_te_seq) == 0:
+            print(f"  [SKIP] Fold {fold+1} — insufficient sequences")
+            continue
+
+        train_ds = TensorDataset(
+            torch.from_numpy(X_tr_seq), torch.from_numpy(y_tr_seq)
+        )
+        test_ds  = TensorDataset(
+            torch.from_numpy(X_te_seq), torch.from_numpy(y_te_seq)
+        )
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                                  shuffle=True, drop_last=False)
+        test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
+                                  shuffle=False, drop_last=False)
+
+        model = TCN(
+            input_dim   = INPUT_DIM,
+            tcn_channels= TCN_CHANNELS,
+            kernel_size = KERNEL_SIZE,
+            dropout     = DROPOUT,
+            n_classes   = N_CLASSES,
+        ).to(DEVICE)
+
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS, eta_min=LR * 0.01
+        )
+
+        best_val_acc  = 0.0
+        best_state    = None
+        patience_ctr  = 0
+        fold_tr_losses = []
+
+        for epoch in range(EPOCHS):
+            tr_loss, _ = train_epoch(model, train_loader, optimizer, criterion)
+            val_labels, val_preds, _ = evaluate(model, test_loader)
+            val_acc = accuracy_score(val_labels, val_preds)
+
+            scheduler.step()
+            fold_tr_losses.append(tr_loss)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state   = {k: v.cpu().clone()
+                                for k, v in model.state_dict().items()}
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+                if patience_ctr >= PATIENCE:
+                    break
+
+        model.load_state_dict(best_state)
+        y_true_f, y_pred_f, y_prob_f = evaluate(model, test_loader)
+
+        acc   = accuracy_score(y_true_f, y_pred_f)
+        f1    = f1_score(y_true_f, y_pred_f, average="macro")
+        kappa = cohen_kappa_score(y_true_f, y_pred_f)
+
+        fold_accs.append(acc)
+        fold_f1s.append(f1)
+        fold_kappas.append(kappa)
+        all_y_true.extend(y_true_f)
+        all_y_pred.extend(y_pred_f)
+        all_y_prob.extend(y_prob_f)
+        train_losses_all.append(fold_tr_losses)
+
+        print(f"  Fold {fold+1:>2} | {subj_str} | "
+              f"seq={len(X_te_seq):>4} | "
+              f"acc={acc:.4f} | f1={f1:.4f} | kappa={kappa:.4f} | "
+              f"epochs={len(fold_tr_losses)}")
+
+    return (
+        np.array(fold_accs), np.array(fold_f1s), np.array(fold_kappas),
+        np.array(all_y_true), np.array(all_y_pred), np.array(all_y_prob),
+        train_losses_all
+    )
+
+
+# ─────────────────────────────────────────────
+#  CHARTS
+# ─────────────────────────────────────────────
+
+def plot_all(fold_accs, fold_f1s, fold_kappas,
+             y_true, y_pred, y_prob,
+             subjects, subject_ids, train_losses_all):
+
+    fig = plt.figure(figsize=(20, 22))
+    fig.suptitle("TCN — EEG Cognitive Workload Classification",
+                 fontsize=16, fontweight="bold", y=0.98)
+    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+    unique_subjs = [np.unique(subjects[subject_ids == s])[0]
+                    for s in np.unique(subject_ids)]
+
+    # ── 1. Per-fold accuracy bar ─────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, :2])
+    x    = np.arange(len(fold_accs))
+    bars = ax1.bar(x, fold_accs * 100, color=SEQ_COLORS[1],
+                   alpha=0.8, edgecolor="white", linewidth=0.5)
+    ax1.axhline(fold_accs.mean() * 100, color="red", linestyle="--",
+                linewidth=1.5, label=f"Mean {fold_accs.mean()*100:.2f}%")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(unique_subjs[:len(fold_accs)],
+                        rotation=45, ha="right", fontsize=8)
+    ax1.set_ylabel("Accuracy (%)")
+    ax1.set_title("Per-subject accuracy — TCN (LOSO)")
+    ax1.set_ylim(0, 100)
+    ax1.legend(fontsize=9)
+    ax1.grid(axis="y", alpha=0.3)
+    for bar, acc in zip(bars, fold_accs):
+        ax1.text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + 0.5,
+                 f"{acc*100:.1f}", ha="center", va="bottom",
+                 fontsize=6, rotation=90)
+
+    # ── 2. Summary box ───────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.axis("off")
+    metrics_list = [
+        ("Mean Accuracy",  f"{fold_accs.mean()*100:.2f}%"),
+        ("Std",            f"±{fold_accs.std()*100:.2f}%"),
+        ("Best Fold",      f"{fold_accs.max()*100:.2f}%"),
+        ("Worst Fold",     f"{fold_accs.min()*100:.2f}%"),
+        ("Mean F1 (macro)",f"{fold_f1s.mean():.4f}"),
+        ("Mean Kappa",     f"{fold_kappas.mean():.4f}"),
+        ("Seq length",     f"{SEQ_LEN} windows ({SEQ_LEN*2}s)"),
+        ("TCN channels",   str(TCN_CHANNELS)),
+    ]
+    y_pos = 0.95
+    ax2.text(0.5, 1.0, "TCN", ha="center", va="top",
+             fontsize=11, fontweight="bold", transform=ax2.transAxes)
+    for label, val in metrics_list:
+        ax2.text(0.05, y_pos, label, ha="left", fontsize=9,
+                 color="gray", transform=ax2.transAxes)
+        ax2.text(0.95, y_pos, val, ha="right", fontsize=9,
+                 fontweight="bold", transform=ax2.transAxes)
+        y_pos -= 0.10
+    rect = plt.Rectangle((0,0), 1, 1, fill=False,
+                          edgecolor=SEQ_COLORS[1], linewidth=2,
+                          transform=ax2.transAxes)
+    ax2.add_patch(rect)
+
+    # ── 3. Confusion matrix ──────────────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 0])
+    cm     = confusion_matrix(y_true, y_pred)
+    cm_pct = cm.astype(float) / cm.sum(axis=1, keepdims=True) * 100
+    im = ax3.imshow(cm_pct, cmap="Oranges", vmin=0, vmax=100)
+    ax3.set_xticks([0,1,2]); ax3.set_yticks([0,1,2])
+    ax3.set_xticklabels(LABELS); ax3.set_yticklabels(LABELS)
+    ax3.set_xlabel("Predicted"); ax3.set_ylabel("True")
+    ax3.set_title("Confusion matrix (%)")
+    plt.colorbar(im, ax=ax3, fraction=0.046)
+    for i in range(3):
+        for j in range(3):
+            ax3.text(j, i, f"{cm_pct[i,j]:.1f}%\n({cm[i,j]})",
+                     ha="center", va="center", fontsize=8,
+                     color="white" if cm_pct[i,j] > 55 else "black")
+
+    # ── 4. Per-class metrics ─────────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 1])
+    report = classification_report(y_true, y_pred,
+                                   target_names=LABELS, output_dict=True)
+    metric_names = ["precision", "recall", "f1-score"]
+    x_cls = np.arange(len(LABELS))
+    width = 0.25
+    for i, m in enumerate(metric_names):
+        vals = [report[l][m] for l in LABELS]
+        ax4.bar(x_cls + i*width, vals, width,
+                label=m.replace("-score",""), color=COLORS[i],
+                alpha=0.85, edgecolor="white")
+    ax4.set_xticks(x_cls + width)
+    ax4.set_xticklabels(LABELS)
+    ax4.set_ylabel("Score")
+    ax4.set_title("Per-class precision, recall, F1")
+    ax4.set_ylim(0, 1.05)
+    ax4.legend(fontsize=8)
+    ax4.grid(axis="y", alpha=0.3)
+
+    # ── 5. ROC curves ────────────────────────────────────────────
+    ax5 = fig.add_subplot(gs[1, 2])
+    y_true_bin = label_binarize(y_true, classes=[0,1,2])
+    y_prob_arr = np.array(y_prob)
+    for i, (label, color) in enumerate(zip(LABELS, COLORS)):
+        try:
+            fpr, tpr, _ = roc_curve(y_true_bin[:,i], y_prob_arr[:,i])
+            auc = roc_auc_score(y_true_bin[:,i], y_prob_arr[:,i])
+            ax5.plot(fpr, tpr, color=color, lw=1.5,
+                     label=f"{label} (AUC={auc:.3f})")
+        except Exception:
+            pass
+    ax5.plot([0,1],[0,1],"k--",lw=1,alpha=0.4)
+    ax5.set_xlabel("False positive rate")
+    ax5.set_ylabel("True positive rate")
+    ax5.set_title("ROC curves (one-vs-rest)")
+    ax5.legend(fontsize=8)
+    ax5.grid(alpha=0.3)
+
+    # ── 6. Comparison with previous models ───────────────────────
+    ax6 = fig.add_subplot(gs[2, :])
+    comparison_models = [
+        ("xgboost_results.npz",  "XGBoost",        "#888780"),
+        ("bilstm_results.npz",   "BiLSTM+Attention","#534AB7"),
+    ]
+    n_folds = len(fold_accs)
+    x_ = np.arange(n_folds)
+    w  = 0.25
+    offsets = [-w, 0, w]
+    plotted = []
+
+    for (fname, mname, mcolor), offset in zip(comparison_models, offsets[:2]):
+        path = os.path.join(RESULTS_DIR, fname)
+        if os.path.exists(path):
+            data = np.load(path, allow_pickle=True)
+            accs = data["fold_accs"][:n_folds]
+            ax6.bar(x_[:len(accs)] + offset, accs*100, w,
+                    label=mname, color=mcolor, alpha=0.8, edgecolor="white")
+            plotted.append(mname)
+
+    ax6.bar(x_ + offsets[min(len(plotted), 2)], fold_accs*100, w,
+            label="TCN", color=SEQ_COLORS[1], alpha=0.8, edgecolor="white")
+    ax6.axhline(fold_accs.mean()*100, color=SEQ_COLORS[1],
+                linestyle="--", linewidth=1.5)
+    ax6.set_xticks(x_)
+    ax6.set_xticklabels(unique_subjs[:n_folds], rotation=45,
+                        ha="right", fontsize=8)
+    ax6.set_ylabel("Accuracy (%)")
+    ax6.set_title(f"Per-fold comparison — TCN ({fold_accs.mean()*100:.2f}%)")
+    ax6.legend(fontsize=9)
+    ax6.grid(axis="y", alpha=0.3)
+    ax6.set_ylim(0, 100)
+
+    # ── 7. Training loss curves ──────────────────────────────────
+    ax7 = fig.add_subplot(gs[3, 0])
+    for i, losses in enumerate(train_losses_all[:5]):
+        ax7.plot(losses, alpha=0.7, linewidth=1, label=f"Fold {i+1}")
+    ax7.set_xlabel("Epoch")
+    ax7.set_ylabel("Cross-entropy loss")
+    ax7.set_title("Training loss (first 5 folds)")
+    ax7.legend(fontsize=7)
+    ax7.grid(alpha=0.3)
+
+    # ── 8. F1 per fold ───────────────────────────────────────────
+    ax8 = fig.add_subplot(gs[3, 1])
+    ax8.plot(range(1, len(fold_f1s)+1), fold_f1s,
+             "o-", color="#1D9E75", linewidth=1.5, markersize=4)
+    ax8.axhline(fold_f1s.mean(), color="red", linestyle="--",
+                linewidth=1.5, label=f"Mean {fold_f1s.mean():.4f}")
+    ax8.set_xlabel("Fold"); ax8.set_ylabel("Macro F1")
+    ax8.set_title("Macro F1 per fold")
+    ax8.legend(fontsize=8); ax8.grid(alpha=0.3)
+
+    # ── 9. Kappa per fold ─────────────────────────────────────────
+    ax9 = fig.add_subplot(gs[3, 2])
+    ax9.plot(range(1, len(fold_kappas)+1), fold_kappas,
+             "s-", color=SEQ_COLORS[1], linewidth=1.5, markersize=4)
+    ax9.axhline(fold_kappas.mean(), color="red", linestyle="--",
+                linewidth=1.5, label=f"Mean {fold_kappas.mean():.4f}")
+    ax9.set_xlabel("Fold"); ax9.set_ylabel("Cohen Kappa")
+    ax9.set_title("Cohen's Kappa per fold")
+    ax9.legend(fontsize=8); ax9.grid(alpha=0.3)
+
+    out_path = os.path.join(RESULTS_DIR, "tcn_charts.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"\n  Charts saved → {out_path}")
+
+
+# ─────────────────────────────────────────────
+#  SAVE + SUMMARY
+# ─────────────────────────────────────────────
+
+def save_results(fold_accs, fold_f1s, fold_kappas, y_true, y_pred):
+    out = os.path.join(RESULTS_DIR, "tcn_results.npz")
+    np.savez(out,
+             fold_accs   = fold_accs,
+             fold_f1s    = fold_f1s,
+             fold_kappas = fold_kappas,
+             y_true      = y_true,
+             y_pred      = y_pred,
+             model_name  = np.array("TCN"))
+    print(f"  Results saved → {out}")
+
+
+def print_summary(fold_accs, fold_f1s, fold_kappas, y_true, y_pred):
+    print(f"\n{'='*65}")
+    print(f"  TCN — Final Results")
+    print(f"{'='*65}")
+    print(f"  Mean Accuracy  : {fold_accs.mean()*100:.2f}%  "
+          f"±{fold_accs.std()*100:.2f}%")
+    print(f"  Best Fold      : {fold_accs.max()*100:.2f}%")
+    print(f"  Worst Fold     : {fold_accs.min()*100:.2f}%")
+    print(f"  Mean F1 (macro): {fold_f1s.mean():.4f}")
+    print(f"  Mean Kappa     : {fold_kappas.mean():.4f}")
+
+    for fname, mname in [("xgboost_results.npz","XGBoost"),
+                          ("bilstm_results.npz","BiLSTM+Attention")]:
+        path = os.path.join(RESULTS_DIR, fname)
+        if os.path.exists(path):
+            prev = np.load(path, allow_pickle=True)
+            delta = fold_accs.mean() - prev["fold_accs"].mean()
+            print(f"\n  vs {mname}: {delta*100:+.2f}%  "
+                  f"({mname}={prev['fold_accs'].mean()*100:.2f}%  "
+                  f"TCN={fold_accs.mean()*100:.2f}%)")
+
+    print(f"\n  Per-class report:")
+    print(classification_report(y_true, y_pred,
+                                target_names=LABELS, digits=4))
+
+    cm = confusion_matrix(y_true, y_pred)
+    print(f"  Confusion matrix:")
+    print(f"  {'':>10}  " + "  ".join(f"{l:>10}" for l in LABELS))
+    for i, row in enumerate(cm):
+        print(f"  {LABELS[i]:>10}  " + "  ".join(f"{v:>10}" for v in row))
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    print(f"Device: {DEVICE}\n")
+    print("Loading dataset...")
+    X, y_class, y_cont, subject_ids, subjects, games = load_dataset()
+    print(f"  X shape : {X.shape}")
+    print(f"  Subjects: {len(np.unique(subject_ids))}")
+    print(f"  Seq len : {SEQ_LEN} windows = {SEQ_LEN*2}s of EEG context\n")
+
+    fold_accs, fold_f1s, fold_kappas, \
+    y_true, y_pred, y_prob, \
+    train_losses = run_loso(X, y_class, subject_ids, subjects)
+
+    print_summary(fold_accs, fold_f1s, fold_kappas, y_true, y_pred)
+    save_results(fold_accs, fold_f1s, fold_kappas, y_true, y_pred)
+    plot_all(fold_accs, fold_f1s, fold_kappas,
+             y_true, y_pred, y_prob,
+             subjects, subject_ids, train_losses)
+
+    print(f"\n  Done. Next: run models/transformer_model.py")
+
+
+if __name__ == "__main__":
+    main()

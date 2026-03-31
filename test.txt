@@ -1,0 +1,5 @@
+# for simulation
+source .venv/bin/activate && python RL/run_simulation.py --mode simulate
+
+# for replay
+source .venv/bin/activate && python RL/run_simulation.py --mode replay --model transformer --subject DREAMER_S01 --game V01
